@@ -186,6 +186,7 @@ class Scheduler(threading.Thread):
 
         self.trigger_event_queue = Queue.Queue()
         self.result_event_queue = Queue.Queue()
+        self.events_waiting_for_replication = dict()
         self.management_event_queue = Queue.Queue()
         self.layout = model.Layout()
 
@@ -803,6 +804,21 @@ class Scheduler(threading.Thread):
         for trigger in self.triggers.values():
             trigger.maintainCache(relevant)
 
+    def process_replication(self, event):
+        if event.type in ['patchset-created', 'draft-published', 'change-merged', 'ref-updated']:
+            self.events_waiting_for_replication[event.ref] = event
+            event = None
+        elif event.type == 'ref-replicated' and event.targetNode == self.config.replicationTarget:
+            if event.status == 'failed':
+                self.log.warn("Replication failed for ref %s" % event.ref)
+                del self.events_waiting_for_replication.pop(event.ref)
+                event = None
+            else:
+                event = self.events_waiting_for_replication.pop(event.ref)
+                if not event:
+                    self.log.warning("Event for ref %s not found in replication wait list" % ref)
+        return event
+
     def process_event_queue(self):
         self.log.debug("Fetching trigger event")
         event = self.trigger_event_queue.get()
@@ -810,7 +826,14 @@ class Scheduler(threading.Thread):
         try:
             project = self.layout.projects.get(event.project_name)
             if not project:
-                self.log.warning("Project %s not found" % event.project_name)
+                self.log.debug("Project %s not found" % event.project_name)
+                return
+            
+            if self.config.wait_for_replication:
+                event = self.process_replication(event)
+                if not event:
+                    return
+            elif event.type == 'ref-replicated':
                 return
 
             for pipeline in self.layout.pipelines.values():
